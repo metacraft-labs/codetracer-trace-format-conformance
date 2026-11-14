@@ -404,18 +404,31 @@ jobs:
         run: |
           & $env:ENTRY_GATE_PYTHON -I -B ci/native-entry-provider.py --output "$env:RUNNER_TEMP/entry-provider-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}" --nim-supplier ../codetracer-trace-format-nim --nim-revision "${{ steps.entry_nim.outputs.revision }}"
 
+      # The gate builds for <arch>-pc-windows-gnullvm (it links with the
+      # provider's Clang), whose standard library the declared tarball rustc
+      # does not carry. That rustc is not a rustup toolchain, so there is no
+      # `rustup target add`: the script downloads the rust-std component of
+      # the compiler's exact release at a pinned SHA-256, checks it was built
+      # from the compiler's commit, and exports a target-only sysroot as
+      # CARGO_TARGET_<TRIPLE>_RUSTFLAGS (ci/provision-rust-target-std.py says
+      # why). Through dev-exec, so it probes the rustc Cargo will run; from
+      # bash, the shell dev-exec is proven in (the Cap'n Proto step above).
       - name: Provision the matching LLVM Rust target
-        shell: pwsh
+        shell: bash
         env:
           ENTRY_GATE_PYTHON: ${{ steps.entry_python.outputs.python-path }}
-        run: |
-          $machine = & $env:ENTRY_GATE_PYTHON -I -B -c "import platform; print(platform.machine().upper())"
-          if ($LASTEXITCODE -ne 0) { throw 'Declared native Python host probe failed' }
-          $target = switch ($machine.Trim()) { 'ARM64' { 'aarch64-pc-windows-gnullvm' }; 'AMD64' { 'x86_64-pc-windows-gnullvm' }; default { throw 'Unsupported actual native host' } }
-          rustup target add $target
+        run: >-
+          dev-exec "$ENTRY_GATE_PYTHON" -I -B ci/provision-rust-target-std.py
+          --destination "$RUNNER_TEMP/rust-target-std-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}"
+
+      # The gate's first Cargo build is `--offline`. On Linux `just lint` has
+      # fetched the locked crates by then; nothing has here.
+      - name: Fetch the locked crates
+        shell: bash
+        run: dev-exec cargo fetch --locked
 
       - name: Run the required native coupled entry and sealed gate
-        shell: pwsh
+        shell: bash
         env:
           ENTRY_GATE_PYTHON: ${{ steps.entry_python.outputs.python-path }}
           # Byte-exact Git checkouts (see "Check out the Nim supplier byte
@@ -428,8 +441,14 @@ jobs:
           GIT_CONFIG_VALUE_1: lf
           GIT_CONFIG_KEY_2: core.symlinks
           GIT_CONFIG_VALUE_2: "false"
-        run: |
-          & $env:ENTRY_GATE_PYTHON -I -B tests/run_entry_coupled.py --work-root "$env:RUNNER_TEMP/entry-gate-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}" --nim-environment-root ../codetracer-trace-format-nim --windows-provider "$env:RUNNER_TEMP/entry-provider-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}/frontend-component.json"
+        # Through dev-exec, from bash: the gate and the build scripts it
+        # drives resolve cargo, rustc, nim, nimble and capnp from PATH, which
+        # only the declared environment puts there.
+        run: >-
+          dev-exec "$ENTRY_GATE_PYTHON" -I -B tests/run_entry_coupled.py
+          --work-root "$RUNNER_TEMP/entry-gate-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}"
+          --nim-environment-root ../codetracer-trace-format-nim
+          --windows-provider "$RUNNER_TEMP/entry-provider-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}/frontend-component.json"
 
       - name: Preserve native entry-provider evidence
         if: always()
