@@ -42,10 +42,12 @@ peer_shell=$("$nix_image" build --no-link --print-out-paths --file ci/entry-runt
 [[ "$peer_shell" =~ ^/nix/store/[a-z0-9]{32}-[^/]+$ ]]
 test "$("$nix_image" path-info --derivation "$peer_shell")" = "$("$nix_image" eval --raw --file ci/entry-runtime-profile.nix peerDevShell.drvPath)"
 test "$(sha256sum "$(readlink -f "$nix_image")" | cut -d' ' -f1)" = "$nix_sha"
-# A failed Nix constructor appends its own error messages here, redacted
-# (ci/prepare-cross-reader-runtime.py, publish_nix_errors). They go to this
-# log only, which masks the job's secrets; the uploaded receipts never hold
-# them. Outside the repository and the runtime output, which are both audited.
+# A failed stage of the runtime constructor appends its own error messages
+# here, redacted: a Nix constructor's error records, any other stage's stderr
+# tail (ci/prepare-cross-reader-runtime.py, publish_failure_diagnostics). They
+# go to this log only, which masks the job's secrets; the uploaded receipts
+# never hold them. Outside the repository and the runtime output, which are
+# both audited.
 nix_diagnostics=$(mktemp "${TMPDIR:-/tmp}/entry-runtime-nix-errors.XXXXXX")
 trap 'rm -f "$nix_diagnostics"' EXIT
 set +e
@@ -56,12 +58,12 @@ set -e
 if ((runtime_status != 0)); then
   "$python_package/bin/python3" ci/report-runtime-constructor-failure.py "$root/.repro/build/entry-runtime" || echo "Public constructor diagnostic unavailable"
   if [[ -s $nix_diagnostics ]]; then
-    echo "::group::Nix errors of the failed runtime constructor"
+    echo "::group::Errors of the failed runtime constructor stages"
     cat "$nix_diagnostics"
     echo "::endgroup::"
     # The first line of each, as annotations on the run's summary page.
     grep -A1 -- '^--- .* error [0-9]* of ' "$nix_diagnostics" | grep -v -- '^--' | head -n 5 |
-      while IFS= read -r line; do echo "::error title=Nix runtime constructor::${line//%/%25}"; done || true
+      while IFS= read -r line; do echo "::error title=Runtime constructor stage::${line//%/%25}"; done || true
   fi
   exit "$runtime_status"
 fi

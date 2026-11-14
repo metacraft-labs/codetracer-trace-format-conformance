@@ -95,7 +95,14 @@ try:
             blob = subprocess.check_output([git, "-C", str(directory), "cat-file", "blob", oid.decode()])
             body = os.fsencode(os.readlink(path)) if path.is_symlink() else path.read_bytes()
             if body != blob:
-                raise RuntimeError("Supplier physical source differs from declared Git body")
+                # Name the member and the likely cause; the comparison itself
+                # is unchanged. Paths are tracked names, never secrets.
+                cause = ("worktree has CRLF where the blob has LF (core.autocrlf)"
+                         if body.replace(b"\r\n", b"\n") == blob and b"\r\n" not in blob
+                         else "symlink target differs (core.symlinks)" if path.is_symlink() or mode == b"120000"
+                         else "content differs")
+                raise RuntimeError("Supplier physical source differs from declared Git body: "
+                                   + os.fsdecode(name) + " (" + cause + ")")
             rows.append((os.fsdecode(name), mode.decode(), hashlib.sha256(body).hexdigest()))
         return rows
     supplier_before = supplier_state()

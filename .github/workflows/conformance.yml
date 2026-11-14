@@ -110,6 +110,13 @@ jobs:
           consumer-directory: ${{ steps.siblings.outputs.consumer }}
           workspace-directory: trace-format-ws
           gh-token: ${{ steps.app-token.outputs.token }}
+          # The job outlives the App token's hour (PR #1 run 43558474940 took
+          # 63 minutes). With the App's credentials setup-dev-env starts its
+          # credential broker, which re-mints the Nix GitHub credential before
+          # it expires, so a Nix fetch late in the suite is not refused with
+          # `401 Bad credentials`.
+          app-id: ${{ vars.CI_TOKEN_PROVIDER_APP_ID }}
+          app-private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
           substituters: ${{ vars.ATTIC_SUBSTITUTER }}
           trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
           siblings: ${{ steps.siblings.outputs.list }}
@@ -139,9 +146,21 @@ jobs:
         if: github.repository == 'metacraft-labs/codetracer-trace-format-conformance'
         run: nix develop --command just lint
 
+      # GITHUB_TOKEN is for one request: the locked Nim peer's Nimble metadata
+      # writer (nix/construct-runtime-metadata.nim) reads the official Nim
+      # release list from api.github.com/repos/nim-lang/Nim/tags, a public
+      # endpoint whose anonymous quota the shared runners exhaust. It is the
+      # job's own token, valid until the job ends, not the App token: that
+      # one expires an hour after "Generate CI token", and the writer runs
+      # about an hour into the job. In PR #1 run 43558474940 it ran at
+      # 05:51, two minutes after the 04:49 App token expired, got 401, and
+      # the writer refused with exit 70 (genuine-nimble-two-metadata-writers).
+      # The environment reaches the writer unchanged (the runtime constructor
+      # passes the peer's activated shell environment), so the value set here
+      # is the value it sends.
       - name: Conformance suite
         env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: nix develop --command just test
 
       - name: Retain the entry runtime receipts
@@ -306,6 +325,60 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'committing the pin failed' }
           }
 
+      # The native entry provider and gate admit the Nim supplier only if every
+      # tracked file's bytes are its Git blob's (ci/native-entry-provider.py,
+      # supplier_state; tests/run_entry_coupled.py). setup-dev-env's sibling
+      # clone is a plain `git clone`, so it inherits Git for Windows' system
+      # `core.autocrlf=true` and writes every LF text file with CRLF: "Supplier
+      # physical source differs from declared Git body" (PR #1 run
+      # 43558474940, eph-win-x64). The supplier has no .gitattributes, so
+      # turning the conversion off is enough. `core.symlinks=false` writes its
+      # one symlink (.github/copilot-instructions.md -> ../AGENTS.md) as a
+      # file holding the target, which is the blob's bytes, whatever the
+      # runner's own `core.symlinks` (Git for Windows writes a real symlink's
+      # target with backslashes, which would not read back as the blob). The
+      # same configuration is passed, per command and never into a config file
+      # (the provider compares the supplier's configuration before and after),
+      # to the two steps that read or clone Nim sources. A persistent runner
+      # keeps its global Git configuration, which this leaves alone.
+      - name: Check out the Nim supplier byte for byte
+        shell: bash
+        env:
+          GIT_CONFIG_COUNT: "3"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+          GIT_CONFIG_KEY_1: core.eol
+          GIT_CONFIG_VALUE_1: lf
+          GIT_CONFIG_KEY_2: core.symlinks
+          GIT_CONFIG_VALUE_2: "false"
+        run: |
+          set -euo pipefail
+          nim=../codetracer-trace-format-nim
+          # A fresh clone with nothing of its own: rewriting it loses nothing.
+          # Asked under the configuration the clone was made with (no command
+          # overrides), under which its converted files are not changes.
+          if [ -n "$(GIT_CONFIG_COUNT=0 git -C "$nim" status --porcelain)" ]; then
+            echo "::error::the Nim supplier checkout has local changes"; exit 1
+          fi
+          # Remove every tracked file, then write them all again from HEAD
+          # under the configuration above. (A `reset --hard` alone rewrites
+          # nothing: the index says the converted files are up to date.)
+          git -C "$nim" ls-files -z | (cd "$nim" && xargs -0 rm -f --)
+          git -C "$nim" reset -q --hard HEAD
+          # An early, readable check; the provider compares every byte. Only
+          # CR line endings the blob lacks count (a symlink's index entry has no
+          # line-ending class at all). awk prints the first five itself and
+          # reads to the end: a `head` here could end the pipeline with
+          # SIGPIPE, and under pipefail the step would fail without this
+          # message.
+          converted=$(git -C "$nim" ls-files --eol |
+            awk '($2 == "w/crlf" || $2 == "w/mixed") && $1 != "i/" substr($2, 3) && n++ < 5')
+          if [ -n "$converted" ]; then
+            echo "::error::the Nim supplier still differs from its blobs in line endings:"
+            echo "$converted"; exit 1
+          fi
+          echo "codetracer-trace-format-nim: $(git -C "$nim" rev-parse HEAD), byte-exact checkout"
+
       - name: Select the locked entry-gate Nim supplier
         id: entry_nim
         shell: pwsh
@@ -319,6 +392,15 @@ jobs:
         shell: pwsh
         env:
           ENTRY_GATE_PYTHON: ${{ steps.entry_python.outputs.python-path }}
+          # Byte-exact Git checkouts (see "Check out the Nim supplier byte
+          # for byte"), also for the dependency clones this step makes.
+          GIT_CONFIG_COUNT: "3"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+          GIT_CONFIG_KEY_1: core.eol
+          GIT_CONFIG_VALUE_1: lf
+          GIT_CONFIG_KEY_2: core.symlinks
+          GIT_CONFIG_VALUE_2: "false"
         run: |
           & $env:ENTRY_GATE_PYTHON -I -B ci/native-entry-provider.py --output "$env:RUNNER_TEMP/entry-provider-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}" --nim-supplier ../codetracer-trace-format-nim --nim-revision "${{ steps.entry_nim.outputs.revision }}"
 
@@ -336,6 +418,16 @@ jobs:
         shell: pwsh
         env:
           ENTRY_GATE_PYTHON: ${{ steps.entry_python.outputs.python-path }}
+          # Byte-exact Git checkouts (see "Check out the Nim supplier byte
+          # for byte"), as the provider saw the supplier and its dependency
+          # clones.
+          GIT_CONFIG_COUNT: "3"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+          GIT_CONFIG_KEY_1: core.eol
+          GIT_CONFIG_VALUE_1: lf
+          GIT_CONFIG_KEY_2: core.symlinks
+          GIT_CONFIG_VALUE_2: "false"
         run: |
           & $env:ENTRY_GATE_PYTHON -I -B tests/run_entry_coupled.py --work-root "$env:RUNNER_TEMP/entry-gate-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}" --nim-environment-root ../codetracer-trace-format-nim --windows-provider "$env:RUNNER_TEMP/entry-provider-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}/frontend-component.json"
 
