@@ -22,6 +22,23 @@ helper_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(helper_module)
 verify_generated_outputs = helper_module.verify_generated_outputs
 
+# Where a failed Nix constructor's own error messages go, so CI can print them
+# (ci/acquire-entry-runtime.sh). Taken out of the environment before anything
+# runs: no child sees it, and the environment-continuity guards below compare
+# against the environment without it. The receipts never hold these bodies.
+NIX_DIAGNOSTICS = os.environ.pop('ENTRY_RUNTIME_NIX_DIAGNOSTICS', None)
+# Values that must never reach the diagnostics, taken while the environment
+# is still whole: every variable whose name says it carries a credential, and
+# the base64 forms in which Git's HTTP authorization headers carry them.
+def _secret_forms(value):
+    yield value
+    for raw in (value, 'x-access-token:' + value):
+        yield base64.b64encode(raw.encode()).decode().rstrip('=')
+SECRET_VALUES = sorted({form for name, value in os.environ.items()
+                        if re.search(r'TOKEN|SECRET|PASSW|AUTH|PRIVATE|CREDENTIAL|_KEY$|^KEY|^GIT_CONFIG_VALUE_', name.upper())
+                        and len(value) >= 8
+                        for form in _secret_forms(value)}, key=len, reverse=True)
+
 arguments = sys.argv[1:]
 peer_override = None
 if len(arguments) == 9 and arguments[-2] == '--peer-root':
@@ -235,6 +252,73 @@ def nix_structured_observation(text):
     result["resultsObserved"] = sorted(results)
     return result
 
+# Credential shapes redacted even when no variable names them: GitHub tokens,
+# credentials embedded in URLs and HTTP authorization headers.
+SECRET_PATTERNS = [
+    (re.compile(r'(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})'), '***'),
+    # Any userinfo in a URL, `user:password@` or a bare token `token@`.
+    (re.compile(r'(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@'), r'\1***@'),
+    (re.compile(r'(?i)\b(authorization:\s*(?:(?:basic|bearer|token)\s+)?)\S+'), r'\1***'),
+    (re.compile(r'(?i)\b(access-tokens\s*=\s*)\S.*'), r'\1***'),
+]
+ANSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+
+def redact(text):
+    for value in SECRET_VALUES:
+        text = text.replace(value, '***')
+    for pattern, replacement in SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+def publish_nix_errors(role, text):
+    """Append what names the cause of a failed Nix constructor, redacted and
+    bounded, to NIX_DIAGNOSTICS for the CI log: its error-level messages and,
+    for each derivation they name, the last lines of that build's log. (With
+    `--log-format internal-json` Nix leaves the log tail out of the error
+    message and streams every build line as a separate record instead.)
+    Nothing else: not the rest of the build logs, not activation output."""
+    if not NIX_DIAGNOSTICS:
+        return
+    messages = []
+    build_of = {}     # activity id -> derivation path
+    tails = {}        # activity id -> last build log lines
+    for line in text.splitlines():
+        if not line.startswith('@nix '):
+            continue
+        try:
+            record = json.loads(line[5:])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        action, fields = record.get('action'), record.get('fields')
+        if action == 'msg' and record.get('level') == 0 and isinstance(record.get('msg'), str):
+            messages.append(ANSI.sub('', record['msg']))
+        elif (action == 'start' and record.get('type') == 105 and isinstance(fields, list)
+              and fields and isinstance(fields[0], str)):
+            build_of[record.get('id')] = fields[0]
+        elif (action == 'result' and record.get('type') == 101 and isinstance(fields, list)
+              and fields and isinstance(fields[0], str)):
+            tail = tails.setdefault(record.get('id'), [])
+            tail.append(ANSI.sub('', fields[0]))
+            del tail[:-40]
+    if messages:
+        named = set(re.findall(r'/nix/store/[a-z0-9]{32}-[^\s\'"`]+\.drv', '\n'.join(messages)))
+        body = ''.join('--- ' + role + ' error ' + str(n + 1) + ' of ' + str(len(messages)) + '\n'
+                       + m.rstrip('\n')[:8000] + '\n' for n, m in enumerate(messages))
+        for activity, drv in build_of.items():
+            if drv in named and tails.get(activity):
+                body += ('--- ' + role + ': last ' + str(len(tails[activity])) + ' build log lines of '
+                         + drv + '\n' + '\n'.join(tails[activity]) + '\n')
+    else:
+        # No structured error: the plain stderr tail is all there is.
+        plain = '\n'.join(l for l in text.splitlines() if not l.startswith('@nix '))
+        body = '--- ' + role + ': no Nix error record; last stderr lines\n' + ANSI.sub('', plain[-8000:]) + '\n'
+    # 64 KiB for the whole file, across every constructor that appends to it.
+    with open(NIX_DIAGNOSTICS, 'a', encoding='utf-8') as stream:
+        room = max(0, 65536 - stream.tell())
+        stream.write(redact(body)[:room])
+
 def run_child(command, peer, role, child_env=None):
     child = subprocess.Popen(command, cwd=peer, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              start_new_session=True, env=child_env)
@@ -316,6 +400,7 @@ def run_child(command, peer, role, child_env=None):
             row['nonsecretFailureClassification']['classes'].update(fixed_classes)
             row['nonsecretFailureClassification']['nixStructuredObservation'] = (
                 nix_structured_observation(text))
+            publish_nix_errors(role, text)
     while True:
         remaining, unknown = [], []
         for proc in Path('/proc').iterdir():

@@ -24,12 +24,45 @@ expected_drv=$("$nix_image" eval --raw --file ci/entry-runtime-profile.nix entry
 test "$("$nix_image" path-info --derivation "$profile")" = "$expected_drv"
 "$nix_image" store verify --recursive --no-trust "$profile"
 test "$(sha256sum "$(readlink -f "$nix_image")" | cut -d' ' -f1)" = "$nix_sha"
+# Realise the locked Nim peer's development shell, online, before the
+# constructor rebuilds it with `nix print-dev-env --offline`. Offline, Nix
+# substitutes nothing: every path of that shell's closure missing from the
+# store is built from source. The shell's pre-commit comes from git-hooks.nix's
+# own nixpkgs, whose stdenv nothing else here puts in the store, so offline it
+# is bootstrapped from the minimal seed. One of that bootstrap's sources is an
+# on-the-fly repo.or.cz snapshot (tinycc
+# cb41cbfe717e4c00d7bb70035cda5ee5f0ff9341.tar.gz), which repo.or.cz now
+# answers with an anti-bot challenge page, so the fetch fails its hash
+# (PR #1 run 43550388329: constant-refusal-40 at
+# actual-locked-peer-cache-constructor). Online, all of it is substituted from
+# the binary cache and only what no cache holds (the toolchain's Nim) builds.
+# The constructor still runs offline and verifies what it uses; this only
+# fills the store it reads.
+peer_shell=$("$nix_image" build --no-link --print-out-paths --file ci/entry-runtime-profile.nix peerDevShell)
+[[ "$peer_shell" =~ ^/nix/store/[a-z0-9]{32}-[^/]+$ ]]
+test "$("$nix_image" path-info --derivation "$peer_shell")" = "$("$nix_image" eval --raw --file ci/entry-runtime-profile.nix peerDevShell.drvPath)"
+test "$(sha256sum "$(readlink -f "$nix_image")" | cut -d' ' -f1)" = "$nix_sha"
+# A failed Nix constructor appends its own error messages here, redacted
+# (ci/prepare-cross-reader-runtime.py, publish_nix_errors). They go to this
+# log only, which masks the job's secrets; the uploaded receipts never hold
+# them. Outside the repository and the runtime output, which are both audited.
+nix_diagnostics=$(mktemp "${TMPDIR:-/tmp}/entry-runtime-nix-errors.XXXXXX")
+trap 'rm -f "$nix_diagnostics"' EXIT
 set +e
-"$profile/bin/prepare-entry-runtime" --root "$root" --output "$root/.repro/build/entry-runtime"
+ENTRY_RUNTIME_NIX_DIAGNOSTICS=$nix_diagnostics \
+  "$profile/bin/prepare-entry-runtime" --root "$root" --output "$root/.repro/build/entry-runtime"
 runtime_status=$?
 set -e
 if ((runtime_status != 0)); then
   "$python_package/bin/python3" ci/report-runtime-constructor-failure.py "$root/.repro/build/entry-runtime" || echo "Public constructor diagnostic unavailable"
+  if [[ -s $nix_diagnostics ]]; then
+    echo "::group::Nix errors of the failed runtime constructor"
+    cat "$nix_diagnostics"
+    echo "::endgroup::"
+    # The first line of each, as annotations on the run's summary page.
+    grep -A1 -- '^--- .* error [0-9]* of ' "$nix_diagnostics" | grep -v -- '^--' | head -n 5 |
+      while IFS= read -r line; do echo "::error title=Nix runtime constructor::${line//%/%25}"; done || true
+  fi
   exit "$runtime_status"
 fi
 "$python_package/bin/python3" - "$root" "${GITHUB_ENV:?}" "${GITHUB_PATH:?}" "$python_package/bin" "$nix_package/bin" <<'PYTHON'
