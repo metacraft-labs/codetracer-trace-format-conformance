@@ -66,6 +66,30 @@ def pe(path, expected):
             raise RuntimeError('Foreign executable machine')
     return {'path': str(path), 'machine': expected, 'sha256': digest(path)}
 
+def stack_reserve(path):
+    # Layout: e_lfanew (u32 at 0x3C) -> 'PE\0\0', then the 20-byte COFF
+    # header (SizeOfOptionalHeader is its u16 at +16), then the optional
+    # header. In a PE32+ image (magic 0x20B; both x64 and ARM64 use it)
+    # SizeOfStackReserve is the u64 at optional-header offset 72.
+    # https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#optional-header-windows-specific-fields-image-only
+    # Every read is length-checked so a truncated or malformed image is
+    # refused instead of misread.
+    image = path.read_bytes()
+    def field(fmt, at):
+        size = struct.calcsize(fmt)
+        if at < 0 or at + size > len(image):
+            raise RuntimeError('Declared executable has a truncated PE header')
+        return struct.unpack_from(fmt, image, at)[0]
+    if image[:2] != b'MZ':
+        raise RuntimeError('Declared executable is not PE')
+    offset = field('<I', 0x3C)
+    if image[offset:offset + 4] != b'PE\0\0':
+        raise RuntimeError('Declared executable is not PE')
+    optional = offset + 24
+    if field('<H', offset + 4 + 16) < 72 + 8 or field('<H', optional) != 0x20B:
+        raise RuntimeError('Declared executable is not PE32+')
+    return field('<Q', optional + 72)
+
 # Windows opens deny new writes/deletion while selected images are in use.
 handles = []
 kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -211,12 +235,29 @@ try:
             raise RuntimeError('Copied Nim runtime differs from declared source')
     nim = native / 'bin/nim.exe'
     target_cpu = 'arm64' if machine == 'ARM64' else 'amd64'
-    run('native-nim-build', [bootstrap, 'c', '--skipUserCfg', '--skipParentCfg', '--os:windows', '--cpu:' + target_cpu,
+    # Build the compiler the way the official Windows distribution is built,
+    # so the gate exercises a realistic compiler rather than a debug one:
+    # * koch.nim `winReleaseArch` runs `koch boot -d:release --cpu:<cpu>`;
+    #   config/nim.cfg turns -d:release into opt:speed with stack traces,
+    #   line tracing and line directives off. Without it the compiler is an
+    #   unoptimised -O0 build whose much larger frames overflowed the main
+    #   thread stack (0xC00000FD) on the first real compilation.
+    # * Neither koch.nim nor compiler/nim.cfg nor config/nim.cfg sets a stack
+    #   reserve; the official bin/nim.exe (MinGW-w64 GCC 11.1 + GNU ld) gets
+    #   GNU ld's PE default of 2 MiB (SizeOfStackReserve 0x200000 in the
+    #   nim-2.2.10_x64.zip image). llvm-mingw links with lld, whose MinGW
+    #   default is the COFF 1 MiB, so restate the official 2 MiB explicitly.
+    #   https://sourceware.org/binutils/docs/ld/Options.html (--stack)
+    native_stack_reserve = 0x200000
+    run('native-nim-build', [bootstrap, 'c', '-d:release', '--skipUserCfg', '--skipParentCfg', '--os:windows', '--cpu:' + target_cpu,
         '--cc:clang', '--clang.exe:' + str(clang), '--clang.linkerexe:' + str(clang),
+        '--passL:-Wl,--stack,' + str(native_stack_reserve),
         '--lib:' + str(nim_source / 'lib'), '--nimcache:' + str(root / 'compiler-cache'),
         '--out:' + str(nim), nim_source / 'compiler/nim.nim'])
     principals['nim'] = hold(nim)
     nim_image = pe(nim, cpu)
+    if stack_reserve(nim) != native_stack_reserve:
+        raise RuntimeError('Native Nim stack reserve differs from the official distribution')
     run('native-nim-version', [nim, '--version'])
     version = (root / 'native-nim-version.stdout').read_text()
     if 'Version 2.2.10' not in version or ('Windows: ' + target_cpu) not in version:

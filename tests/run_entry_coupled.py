@@ -8,6 +8,28 @@ from pathlib import Path
 import argparse, ctypes, hashlib, json, os, platform, shutil, stat, struct, subprocess, sys, tempfile, tomllib
 from contextlib import ExitStack
 
+# NTSTATUS codes a crashing Windows child commonly exits with. A process killed
+# by one reports the raw code as its exit status (e.g. 3221225725), which is
+# unreadable in a CI log, so name it.
+# https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/596a1078-e883-4972-9bbc-49e60bebca55
+NTSTATUS_NAMES = {
+    0xC0000005: 'STATUS_ACCESS_VIOLATION',
+    0xC000001D: 'STATUS_ILLEGAL_INSTRUCTION',
+    0xC0000094: 'STATUS_INTEGER_DIVIDE_BY_ZERO',
+    0xC00000FD: 'STATUS_STACK_OVERFLOW',
+    0xC0000135: 'STATUS_DLL_NOT_FOUND',
+    0xC0000139: 'STATUS_ENTRYPOINT_NOT_FOUND',
+    0xC0000142: 'STATUS_DLL_INIT_FAILED',
+    0xC0000409: 'STATUS_STACK_BUFFER_OVERRUN',
+    0xC0000417: 'STATUS_INVALID_CRUNTIME_PARAMETER',
+}
+
+
+def describe_exit(code):
+    """Render a child exit status, naming a known Windows NTSTATUS."""
+    name = NTSTATUS_NAMES.get(code & 0xFFFFFFFF) if os.name == 'nt' else None
+    return str(code) + (' (0x%08X %s)' % (code & 0xFFFFFFFF, name) if name else '')
+
 # Dynamic producer helpers must not write build cache into tracked source roots.
 sys.dont_write_bytecode = True
 
@@ -405,7 +427,11 @@ try:
             unix_authority_guard()
         if argv[0] != 'nim':
             raise RuntimeError('Unsupported declared Nim invocation')
-        subprocess.run([nim, argv[1], *native_flags, *argv[2:]], cwd=environment, env=nim_env, check=True)
+        command = [nim, argv[1], *native_flags, *argv[2:]]
+        completed = subprocess.run(command, cwd=environment, env=nim_env)
+        if completed.returncode:
+            print('Nim exited with status ' + describe_exit(completed.returncode), file=sys.stderr, flush=True)
+            raise subprocess.CalledProcessError(completed.returncode, command)
 
     # Retain real artifacts for source-bound qualification and diagnosis.
     if args.work_root:
