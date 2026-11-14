@@ -1,0 +1,7 @@
+# Cross-repo siblings cloned by setup-dev-env at the revisions this
+# repository's repro.lock pins: the two implementations of the CodeTracer
+# trace format this suite compares. conformance.yml selects them itself (the
+# same workflow also runs from each library's CI); this file declares them for
+# the other sibling tooling.
+codetracer-trace-format
+codetracer-trace-format-nim

@@ -1,0 +1,5 @@
+/target
+/.nimble
+/.nimcache
+/build
+/.repro

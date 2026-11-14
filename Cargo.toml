@@ -1,0 +1,50 @@
+# The Rust side of the cross-implementation tests. Every test here holds the
+# Rust implementation (the sibling `codetracer-trace-format` checkout) against
+# the Nim one (`codetracer-trace-format-nim`):
+#
+#   * `tests/nim_*_crossread.rs` are the Rust halves of the Nim drivers in
+#     `nim/`, which write a container with the Nim writer and run them;
+#   * the writer comparisons (`*_cross_writer.rs`, `writer_differential.rs`,
+#     `*_parity*.rs`, ...) drive both writers, the Nim one through the
+#     `codetracer_trace_writer_nim` adapter, and compare their output;
+#   * the reader comparisons (`*_cross_reader.rs`, `*_refused_alike.rs`,
+#     `*_crossread.rs`) read one implementation's output with the other's
+#     reader;
+#   * `c_abi_parity.rs` drives both C libraries from one C host;
+#   * `recorded_entry_*` read the genuine Nim producer's images, which the
+#     entry gate (`tests/run_entry_coupled.py`) publishes.
+#
+# The path dependencies are what make the sibling layout load-bearing: this
+# package builds against exactly the checkouts beside it.
+[package]
+name = "codetracer_trace_format_conformance"
+version = "0.1.0"
+edition = "2024"
+authors = ["Metacraft Labs Ltd"]
+description = "Cross-implementation conformance tests of the CodeTracer trace format"
+repository = "https://github.com/metacraft-labs/codetracer-trace-format-conformance"
+license = "MIT"
+publish = false
+
+# A workspace of its own: nothing above this directory is part of it.
+[workspace]
+
+[dev-dependencies]
+codetracer_ctfs = { path = "../codetracer-trace-format/codetracer_ctfs" }
+codetracer_trace_reader = { path = "../codetracer-trace-format/codetracer_trace_reader" }
+codetracer_trace_types = { path = "../codetracer-trace-format/codetracer_trace_types" }
+codetracer_trace_writer = { path = "../codetracer-trace-format/codetracer_trace_writer" }
+# The Rust adapter over the Nim writer and reader: how the Rust-side tests
+# drive the Nim implementation.
+codetracer_trace_writer_nim = { path = "../codetracer-trace-format/codetracer_trace_writer_nim" }
+# `assignments_reach_the_trace` decodes the serde-CBOR `RValue` the Nim
+# writer stores, with the encoder the adapter and the Rust writer use.
+cbor4ii = { version = "1.0.0", features = ["serde1", "use_std"] }
+cc = "1.2"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3"
+zstd = "0.13"
+zstd-safe = "7.2"

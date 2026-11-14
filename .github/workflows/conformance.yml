@@ -1,0 +1,314 @@
+name: Conformance
+
+# Runs this repository's suite: every test that holds the Nim implementation
+# of the CodeTracer trace format (codetracer-trace-format-nim) and the Rust one
+# (codetracer-trace-format) against each other, including the genuine-producer
+# entry gate on Linux and on native Windows.
+#
+# It runs in three places, so that a change to either implementation is held
+# against the other before it lands:
+#
+#   * here, on a change to this repository, against both libraries;
+#   * in codetracer-trace-format, whose `conformance.yml` calls this workflow
+#     (`workflow_call`) for every change there;
+#   * in codetracer-trace-format-nim, likewise.
+#
+# Under `workflow_call` the `github` context is the CALLER's, so
+# `github.repository`/`github.sha` name the commit under test. Each job lays
+# the three repositories out side by side under `trace-format-ws/`, the layout
+# every path in this suite assumes:
+#
+#   trace-format-ws/codetracer-trace-format
+#   trace-format-ws/codetracer-trace-format-nim
+#   trace-format-ws/codetracer-trace-format-conformance
+#
+# The commit under test is checked out by `actions/checkout`, and it is
+# setup-dev-env's consumer: setup-dev-env refuses a nested consumer whose HEAD
+# is not `github.sha`, and resolves bare sibling names from the consumer's
+# committed repro.lock. This repository (when it is not the commit under test)
+# and the other library are siblings of the consumer, cloned by setup-dev-env.
+# "Select siblings" says at which revisions. The suite itself always runs in
+# this repository's checkout, with this repository's dev shell.
+
+on:
+  push:
+    branches: [dev, stable]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# Cancel superseded PR runs only: a new push to a PR makes its previous run
+# moot, and stale runs otherwise hold scarce self-hosted runners. Every other
+# event (mainline push, merge_group, tag, dispatch, schedule) gets a group
+# unique to its run_id, so it is never cancelled and never cancels anything.
+concurrency:
+  group: conformance-${{ github.repository }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  linux:
+    runs-on: [self-hosted, linux, x64, ephemeral, incus]
+    defaults:
+      run:
+        shell: bash
+        working-directory: trace-format-ws/codetracer-trace-format-conformance
+    steps:
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      # Which revision of each repository the suite runs with.
+      #
+      #   * The commit under test is checked out below at `github.sha`, and
+      #     is setup-dev-env's consumer.
+      #   * A sibling the caller's repro.lock pins is named bare, so it is
+      #     taken at that pin: both libraries for this repository's own runs,
+      #     and the Nim library for the Rust one, whose recipe depends on it.
+      #   * Anything else is named at its agent landing branch, `agents`,
+      #     where the changes that move together with the caller's land: this
+      #     repository for both libraries, and the Rust library for the Nim
+      #     one, which depends on neither of the others.
+      - name: Select siblings
+        id: siblings
+        working-directory: .
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REPOSITORY}" in
+            metacraft-labs/codetracer-trace-format-conformance)
+              list="codetracer-trace-format codetracer-trace-format-nim" ;;
+            metacraft-labs/codetracer-trace-format)
+              list="codetracer-trace-format-nim codetracer-trace-format-conformance=agents" ;;
+            metacraft-labs/codetracer-trace-format-nim)
+              list="codetracer-trace-format=agents codetracer-trace-format-conformance=agents" ;;
+            *)
+              echo "::error::the conformance suite is not set up for ${GITHUB_REPOSITORY}"
+              exit 1 ;;
+          esac
+          echo "list=${list}" >> "$GITHUB_OUTPUT"
+          echo "under-test=${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
+          echo "consumer=trace-format-ws/${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the commit under test
+        uses: actions/checkout@v5
+        with:
+          path: trace-format-ws/${{ steps.siblings.outputs.under-test }}
+
+      - name: Setup dev env
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        with:
+          env-flavor: nix
+          consumer-directory: ${{ steps.siblings.outputs.consumer }}
+          workspace-directory: trace-format-ws
+          gh-token: ${{ steps.app-token.outputs.token }}
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          siblings: ${{ steps.siblings.outputs.list }}
+
+      - name: Report the three checkouts
+        run: |
+          set -euo pipefail
+          for repo in codetracer-trace-format codetracer-trace-format-nim codetracer-trace-format-conformance; do
+            test -d "../${repo}/.git" || { echo "::error::${repo} is not checked out beside this repository"; exit 1; }
+            echo "${repo}: $(git -C "../${repo}" rev-parse HEAD)"
+          done
+
+      # The entry gate admits only the Nim peer at the revision repro.lock
+      # pins, and only a committed checkout of this repository. When this run
+      # gates a library change, the lock cannot name it yet: pin the libraries
+      # under test and commit that on the runner (never pushed).
+      - name: Pin the libraries under test
+        run: |
+          set -euo pipefail
+          python3 ci/pin-libraries-under-test.py
+          if ! git diff --quiet; then
+            git -c user.name=conformance-ci -c user.email=conformance-ci@localhost \
+              commit -q -am "ci: pin the libraries under test"
+          fi
+
+      - name: Lint
+        if: github.repository == 'metacraft-labs/codetracer-trace-format-conformance'
+        run: nix develop --command just lint
+
+      - name: Conformance suite
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: nix develop --command just test
+
+      - name: Retain the entry runtime receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-entry-runtime-linux
+          path: trace-format-ws/codetracer-trace-format-conformance/.repro/build/entry-runtime/runtime/*.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
+  # The native coupled entry and sealed gate on Windows: the Nim producer and
+  # the Rust producer built by native Windows toolchains, each reading the
+  # other's images (tests/run_entry_coupled.py, Windows branch).
+  #
+  # Not run for codetracer-trace-format-nim's changes. setup-dev-env builds
+  # its environment from its consumer, which must be the commit under test,
+  # and the Nim library's recipe declares no Rust toolchain or Cap'n Proto
+  # (it depends on no other implementation), so the Rust half of this gate
+  # has nothing to build with there. The Linux job holds Nim changes against
+  # the whole suite; the Rust library's changes, and this repository's, run
+  # both jobs.
+  windows:
+    if: github.repository != 'metacraft-labs/codetracer-trace-format-nim'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [eph-win-x64, eph-win-arm64]
+    # The x64 ephemeral pool is paused; use the served Windows x64 class.
+    runs-on: ${{ matrix.runner == 'eph-win-x64' && fromJSON('["self-hosted", "Windows", "X64", "dev-env-ready"]') || matrix.runner }}
+    env:
+      REPRO_TOOL_PROVISIONING: tarball
+    defaults:
+      run:
+        working-directory: trace-format-ws/codetracer-trace-format-conformance
+    steps:
+      - name: Generate CI token
+        id: ci_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Select siblings
+        id: siblings
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REPOSITORY}" in
+            metacraft-labs/codetracer-trace-format-conformance)
+              list="codetracer-trace-format codetracer-trace-format-nim" ;;
+            metacraft-labs/codetracer-trace-format)
+              list="codetracer-trace-format-nim" ;;
+            *)
+              echo "::error::the conformance suite is not set up for ${GITHUB_REPOSITORY}"
+              exit 1 ;;
+          esac
+          echo "list=${list}" >> "$GITHUB_OUTPUT"
+          echo "under-test=${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
+          echo "consumer=trace-format-ws/${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the commit under test
+        uses: actions/checkout@v5
+        with:
+          path: trace-format-ws/${{ steps.siblings.outputs.under-test }}
+
+      # This suite at its agent landing branch, checked out before the dev
+      # env because the CMake step below runs one of its scripts.
+      - name: Checkout this suite
+        if: github.repository != 'metacraft-labs/codetracer-trace-format-conformance'
+        uses: actions/checkout@v5
+        with:
+          repository: metacraft-labs/codetracer-trace-format-conformance
+          ref: agents
+          token: ${{ steps.ci_token.outputs.token }}
+          path: trace-format-ws/codetracer-trace-format-conformance
+          persist-credentials: false
+
+      # The pinned Cap'n Proto constructor builds from source on native ARM64.
+      # Supply its declared CMake prerequisite from exact official archive pins.
+      - name: Provision pinned native CMake
+        shell: pwsh
+        run: |
+          $architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) {
+            "Arm64" { "arm64" }
+            "X64" { "x64" }
+            default { throw "Unsupported native Windows CMake architecture." }
+          }
+          $destination = Join-Path $env:RUNNER_TEMP ("trace-capnp-cmake-" + [Guid]::NewGuid().ToString("N"))
+          ./ci/ensure-native-cmake.ps1 -Architecture $architecture -Destination $destination
+
+      - name: Setup dev env (reprobuild)
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@26448a158691e2ce4858c10312618a306a333b8e
+        with:
+          env-flavor: reprobuild
+          consumer-directory: ${{ steps.siblings.outputs.consumer }}
+          workspace-directory: trace-format-ws
+          repro-version: v0.2.17
+          gh-token: ${{ steps.ci_token.outputs.token }}
+          siblings: ${{ steps.siblings.outputs.list }}
+
+      - name: Verify the declared Cap'n Proto executable
+        shell: bash
+        run: dev-exec capnp --version
+
+      - name: Provision the declared native entry-gate Python
+        id: entry_python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: 3.13.16
+          architecture: ${{ matrix.runner == 'eph-win-arm64' && 'arm64' || 'x64' }}
+
+      - name: Pin the libraries under test
+        shell: pwsh
+        env:
+          ENTRY_GATE_PYTHON: ${{ steps.entry_python.outputs.python-path }}
+        run: |
+          & $env:ENTRY_GATE_PYTHON -I -B ci/pin-libraries-under-test.py
+          if ($LASTEXITCODE -ne 0) { throw 'pinning the libraries under test failed' }
+          git diff --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git -c user.name=conformance-ci -c user.email=conformance-ci@localhost commit -q -am "ci: pin the libraries under test"
+            if ($LASTEXITCODE -ne 0) { throw 'committing the pin failed' }
+          }
+
+      - name: Select the locked entry-gate Nim supplier
+        id: entry_nim
+        shell: pwsh
+        env:
+          ENTRY_GATE_PYTHON: ${{ steps.entry_python.outputs.python-path }}
+        run: '& $env:ENTRY_GATE_PYTHON -I -B ci/select-entry-nim-supplier.py'
+
+      # The sibling checkout is the supplier: after the pin step it is exactly
+      # the revision the lock names, which native-entry-provider.py verifies.
+      - name: Provision the declared native entry compiler and Zstd
+        shell: pwsh
+        env:
+          ENTRY_GATE_PYTHON: ${{ steps.entry_python.outputs.python-path }}
+        run: |
+          & $env:ENTRY_GATE_PYTHON -I -B ci/native-entry-provider.py --output "$env:RUNNER_TEMP/entry-provider-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}" --nim-supplier ../codetracer-trace-format-nim --nim-revision "${{ steps.entry_nim.outputs.revision }}"
+
+      - name: Provision the matching LLVM Rust target
+        shell: pwsh
+        env:
+          ENTRY_GATE_PYTHON: ${{ steps.entry_python.outputs.python-path }}
+        run: |
+          $machine = & $env:ENTRY_GATE_PYTHON -I -B -c "import platform; print(platform.machine().upper())"
+          if ($LASTEXITCODE -ne 0) { throw 'Declared native Python host probe failed' }
+          $target = switch ($machine.Trim()) { 'ARM64' { 'aarch64-pc-windows-gnullvm' }; 'AMD64' { 'x86_64-pc-windows-gnullvm' }; default { throw 'Unsupported actual native host' } }
+          rustup target add $target
+
+      - name: Run the required native coupled entry and sealed gate
+        shell: pwsh
+        env:
+          ENTRY_GATE_PYTHON: ${{ steps.entry_python.outputs.python-path }}
+        run: |
+          & $env:ENTRY_GATE_PYTHON -I -B tests/run_entry_coupled.py --work-root "$env:RUNNER_TEMP/entry-gate-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}" --nim-environment-root ../codetracer-trace-format-nim --windows-provider "$env:RUNNER_TEMP/entry-provider-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}/frontend-component.json"
+
+      - name: Preserve native entry-provider evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-entry-provider-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/entry-provider-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}/**/*.json
+            ${{ runner.temp }}/entry-provider-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}/*.stdout
+            ${{ runner.temp }}/entry-provider-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}/*.stderr
+            ${{ runner.temp }}/entry-gate-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}/nim-images/*.ct
+            ${{ runner.temp }}/entry-gate-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}/rust-images/*.ct
+          if-no-files-found: error
