@@ -15,12 +15,15 @@ name: Conformance
 #
 # Under `workflow_call` the `github` context is the CALLER's, so
 # `github.repository`/`github.sha` name the commit under test. Each job lays
-# the three repositories out side by side under `trace-format-ws/`, the layout
-# every path in this suite assumes:
+# the three repositories out side by side, the layout every path in this
+# suite assumes. The Linux job puts them under `trace-format-ws/`:
 #
 #   trace-format-ws/codetracer-trace-format
 #   trace-format-ws/codetracer-trace-format-nim
 #   trace-format-ws/codetracer-trace-format-conformance
+#
+# The Windows job puts them beside the runner's checkout root instead, for
+# path length (see that job).
 #
 # The commit under test is checked out by `actions/checkout`, and it is
 # setup-dev-env's consumer: setup-dev-env refuses a nested consumer whose HEAD
@@ -162,6 +165,31 @@ jobs:
   # has nothing to build with there. The Linux job holds Nim changes against
   # the whole suite; the Rust library's changes, and this repository's, run
   # both jobs.
+  #
+  # Layout. Unlike the Linux job, this one keeps the commit under test at the
+  # runner's own checkout root and its siblings beside it (setup-dev-env's
+  # default layout, as codetracer-trace-format's Windows job had), because
+  # Windows paths have a hard length limit and the Nim compiler that repro
+  # runs on the consumer's recipe is not long-path aware. repro writes the
+  # recipe's sibling shims to
+  #
+  #   <consumer>\.repro\dev-env\default\provider-work\home\tmp\repro-sibling-shims\
+  #     c_<fnv32>_<last 30 path chars>\repro_sib_codetracer_trace_format_nim.nim
+  #
+  # which is the consumer root plus up to 67 + 43 + 42 characters. Under
+  # `trace-format-ws\` the consumer root was 147 characters and the shim
+  # directory 257, over CreateDirectory's 248 (PR #1 run 43550388329, "The
+  # filename or extension is too long"). At the checkout root it is
+  #
+  #   C:\actions-runner\_work\codetracer-trace-format-conformance\codetracer-trace-format-conformance  (95)
+  #   C:\actions-runner\_work\codetracer-trace-format\codetracer-trace-format                          (71)
+  #
+  # so the shim directory is at most 205 (limit 248) and the shim file 247
+  # (limit 260) here, and 181 / 223 for the Rust library's runs. The runner
+  # names the checkout root after the repository, which leaves nothing
+  # shorter to choose. Every step runs in this suite's checkout,
+  # `../codetracer-trace-format-conformance` from the checkout root (which,
+  # for this repository's own runs, is the checkout root itself).
   windows:
     if: github.repository != 'metacraft-labs/codetracer-trace-format-nim'
     strategy:
@@ -174,7 +202,7 @@ jobs:
       REPRO_TOOL_PROVISIONING: tarball
     defaults:
       run:
-        working-directory: trace-format-ws/codetracer-trace-format-conformance
+        working-directory: ../codetracer-trace-format-conformance
     steps:
       - name: Generate CI token
         id: ci_token
@@ -200,28 +228,34 @@ jobs:
               exit 1 ;;
           esac
           echo "list=${list}" >> "$GITHUB_OUTPUT"
-          echo "under-test=${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
-          echo "consumer=trace-format-ws/${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout the commit under test
         uses: actions/checkout@v5
-        with:
-          path: trace-format-ws/${{ steps.siblings.outputs.under-test }}
 
-      # This suite at its agent landing branch, checked out before the dev
-      # env because the CMake step below runs one of its scripts.
-      - name: Checkout this suite
+      # This suite at its agent landing branch, beside the commit under test,
+      # cloned before the dev env because the CMake step below runs one of its
+      # scripts. Not actions/checkout, which writes only inside the checkout
+      # root. The token goes in through the environment, never into the
+      # clone's configuration. A clone a previous job left there (the x64
+      # class is persistent) is replaced, never reused.
+      - name: Clone this suite
         if: github.repository != 'metacraft-labs/codetracer-trace-format-conformance'
-        uses: actions/checkout@v5
-        with:
-          repository: metacraft-labs/codetracer-trace-format-conformance
-          ref: agents
-          token: ${{ steps.ci_token.outputs.token }}
-          path: trace-format-ws/codetracer-trace-format-conformance
-          persist-credentials: false
+        shell: bash
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.ci_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          rm -rf ../codetracer-trace-format-conformance
+          echo "::add-mask::$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.https://github.com/metacraft-labs/.extraHeader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" \
+            git clone --quiet --single-branch --branch agents \
+              https://github.com/metacraft-labs/codetracer-trace-format-conformance \
+              ../codetracer-trace-format-conformance
+          echo "codetracer-trace-format-conformance: $(git -C ../codetracer-trace-format-conformance rev-parse HEAD)"
 
-      # The pinned Cap'n Proto constructor builds from source on native ARM64.
-      # Supply its declared CMake prerequisite from exact official archive pins.
       - name: Provision pinned native CMake
         shell: pwsh
         run: |
@@ -237,8 +271,6 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@26448a158691e2ce4858c10312618a306a333b8e
         with:
           env-flavor: reprobuild
-          consumer-directory: ${{ steps.siblings.outputs.consumer }}
-          workspace-directory: trace-format-ws
           repro-version: v0.2.17
           gh-token: ${{ steps.ci_token.outputs.token }}
           siblings: ${{ steps.siblings.outputs.list }}
@@ -247,12 +279,19 @@ jobs:
         shell: bash
         run: dev-exec capnp --version
 
+      # python.org's NuGet build at an exact pin, extracted under RUNNER_TEMP
+      # (ci/provision-entry-python.ps1 says why not actions/setup-python).
       - name: Provision the declared native entry-gate Python
         id: entry_python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
-        with:
-          python-version: 3.13.16
-          architecture: ${{ matrix.runner == 'eph-win-arm64' && 'arm64' || 'x64' }}
+        shell: pwsh
+        run: |
+          $architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) {
+            "Arm64" { "arm64" }
+            "X64" { "x64" }
+            default { throw "Unsupported native Windows Python architecture." }
+          }
+          $destination = Join-Path $env:RUNNER_TEMP ("entry-python-" + [Guid]::NewGuid().ToString("N"))
+          ./ci/provision-entry-python.ps1 -Architecture $architecture -Destination $destination
 
       - name: Pin the libraries under test
         shell: pwsh
