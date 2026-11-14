@@ -8,6 +8,15 @@ from pathlib import Path, PurePosixPath
 import argparse, ctypes, hashlib, json, os, platform, shutil, stat, struct, subprocess, sys
 import tarfile, urllib.request, zipfile
 
+# nim-lang.org answers urllib's default "Python-urllib/x.y" User-Agent with
+# 403 Forbidden (bot protection), so every download here names this suite
+# instead. urlretrieve goes through the installed opener. Integrity does not
+# depend on the header: each archive is still checked against its pinned
+# SHA-256 below.
+_opener = urllib.request.build_opener()
+_opener.addheaders = [("User-Agent", "codetracer-trace-format-conformance-ci")]
+urllib.request.install_opener(_opener)
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--output', required=True, type=Path)
 parser.add_argument('--nim-supplier', required=True, type=Path)
