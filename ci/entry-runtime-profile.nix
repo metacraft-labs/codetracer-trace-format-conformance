@@ -47,6 +47,7 @@ let
   peerGit = peer.peerGit;
   peerNimbleSource = peer.peerNimbleSource;
 in {
+  peerDevShell = peer.peerDevShell;
   constructorNix = pkgs.nix;
   constructorPython = pkgs.python3;
   entryRuntime = pkgs.writeShellScriptBin "prepare-entry-runtime" ''

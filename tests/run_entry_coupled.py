@@ -8,6 +8,28 @@ from pathlib import Path
 import argparse, ctypes, hashlib, json, os, platform, shutil, stat, struct, subprocess, sys, tempfile, tomllib
 from contextlib import ExitStack
 
+# NTSTATUS codes a crashing Windows child commonly exits with. A process killed
+# by one reports the raw code as its exit status (e.g. 3221225725), which is
+# unreadable in a CI log, so name it.
+# https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/596a1078-e883-4972-9bbc-49e60bebca55
+NTSTATUS_NAMES = {
+    0xC0000005: 'STATUS_ACCESS_VIOLATION',
+    0xC000001D: 'STATUS_ILLEGAL_INSTRUCTION',
+    0xC0000094: 'STATUS_INTEGER_DIVIDE_BY_ZERO',
+    0xC00000FD: 'STATUS_STACK_OVERFLOW',
+    0xC0000135: 'STATUS_DLL_NOT_FOUND',
+    0xC0000139: 'STATUS_ENTRYPOINT_NOT_FOUND',
+    0xC0000142: 'STATUS_DLL_INIT_FAILED',
+    0xC0000409: 'STATUS_STACK_BUFFER_OVERRUN',
+    0xC0000417: 'STATUS_INVALID_CRUNTIME_PARAMETER',
+}
+
+
+def describe_exit(code):
+    """Render a child exit status, naming a known Windows NTSTATUS."""
+    name = NTSTATUS_NAMES.get(code & 0xFFFFFFFF) if os.name == 'nt' else None
+    return str(code) + (' (0x%08X %s)' % (code & 0xFFFFFFFF, name) if name else '')
+
 # Dynamic producer helpers must not write build cache into tracked source roots.
 sys.dont_write_bytecode = True
 
@@ -89,6 +111,111 @@ try:
                     raise RuntimeError('Native executable machine differs')
             hold_image(path)
             return str(path)
+        def imported_dlls(path):
+            """The DLL names a PE image's import and delay-import tables name.
+
+            Reads the tables the loader resolves before (imports) or on first
+            call into (delay imports) the image; a DLL missing from either
+            fails the process with STATUS_DLL_NOT_FOUND.
+            https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-idata-section
+            https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#delay-load-import-tables-image-only
+            """
+            image = Path(path).read_bytes()
+            def unpack(layout, offset):
+                if offset < 0 or offset + struct.calcsize(layout) > len(image):
+                    raise RuntimeError('Truncated native image import table')
+                return struct.unpack_from(layout, image, offset)
+            header = unpack('<I', 0x3c)[0]
+            if image[header:header + 4] != b'PE\0\0':
+                raise RuntimeError('Native executable lacks PE header')
+            sections, optional_size = unpack('<H', header + 6)[0], unpack('<H', header + 20)[0]
+            optional = header + 24
+            magic = unpack('<H', optional)[0]
+            if magic not in (0x10b, 0x20b):
+                raise RuntimeError('Unknown native image optional header')
+            directories = optional + (112 if magic == 0x20b else 96)
+            if optional_size < directories - optional:
+                raise RuntimeError('Truncated native image optional header')
+            # A directory entry past SizeOfOptionalHeader would be read out of
+            # the section table, so the count is bounded by the header too.
+            directory_count = min(unpack('<I', directories - 4)[0], (optional + optional_size - directories) // 8)
+            table = optional + optional_size
+            spans = [unpack('<IIII', table + 40 * index + 8) for index in range(sections)]
+            def file_offset(rva):
+                for virtual_size, address, raw_size, raw_pointer in spans:
+                    if address <= rva < address + max(virtual_size, raw_size):
+                        if rva - address >= raw_size:
+                            raise RuntimeError('Native image import name outside file data')
+                        return raw_pointer + rva - address
+                raise RuntimeError('Native image import RVA outside every section')
+            def name_at(rva):
+                start = file_offset(rva)
+                end = image.find(b'\0', start)
+                if end < 0:
+                    raise RuntimeError('Unterminated native image import name')
+                try:
+                    return image[start:end].decode('ascii')
+                except UnicodeDecodeError:
+                    raise RuntimeError('Non-ASCII native image import name') from None
+            def directory(index):
+                return unpack('<II', directories + 8 * index) if index < directory_count else (0, 0)
+            names = []
+            rva, size = directory(1)
+            if size:
+                offset = file_offset(rva)
+                while True:
+                    original, _, _, name, first = unpack('<IIIII', offset)
+                    if not (original or name or first):
+                        break
+                    names.append(name_at(name)); offset += 20
+            rva, size = directory(13)
+            if size:
+                offset = file_offset(rva)
+                while True:
+                    attributes, name = unpack('<II', offset)
+                    if not (attributes or name):
+                        break
+                    # Bit 0 clear is the obsolete VA-based form; no current
+                    # linker emits it, so refuse rather than misread it.
+                    if not attributes & 1:
+                        raise RuntimeError('Unsupported VA-based native delay-import table')
+                    names.append(name_at(name)); offset += 32
+            return names
+        kernel.GetSystemDirectoryW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+        kernel.GetSystemDirectoryW.restype = ctypes.c_uint32
+        system_buffer = ctypes.create_unicode_buffer(32768)
+        # 0 is failure; a value not below the buffer length is the size it
+        # would have needed, and the buffer then holds no path.
+        system_length = kernel.GetSystemDirectoryW(system_buffer, len(system_buffer))
+        if not 0 < system_length < len(system_buffer):
+            raise OSError(ctypes.get_last_error(), 'Cannot locate the Windows system directory')
+        system_directory = Path(system_buffer.value)
+        # Windows resolves DLL names without regard to case.
+        system_dlls = {entry.name.casefold() for entry in os.scandir(system_directory) if entry.is_file()}
+        def check_system_imports(path, provider_runtime):
+            """Refuse a produced image that loads anything but the OS's own DLLs.
+
+            The gate starts its products with no provider directory on the
+            search path, so an image importing a toolchain runtime DLL (LLVM's
+            libunwind.dll, libc++.dll, libwinpthread-1.dll) fails to start
+            with STATUS_DLL_NOT_FOUND. Each import must be an API set (resolved
+            by the loader's schema, not a file) or a DLL present in the Windows
+            system directory, and none may share a name with a DLL the
+            declared provider ships.
+            https://learn.microsoft.com/en-us/windows/win32/apiindex/windows-apisets
+            https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order
+            """
+            for name in imported_dlls(path):
+                folded = name.casefold()
+                # A name with a separator is a path the loader resolves as one,
+                # which neither census below describes (nor may the API-set
+                # prefix carry one past them).
+                if not folded or any(character in folded for character in '/\\:'):
+                    raise RuntimeError(Path(path).name + ' imports the non-bare DLL name ' + name)
+                if folded in provider_runtime:
+                    raise RuntimeError(Path(path).name + ' imports the provider runtime DLL ' + name)
+                if not folded.startswith(('api-ms-win-', 'ext-ms-win-')) and folded not in system_dlls:
+                    raise RuntimeError(Path(path).name + ' imports ' + name + ', which the Windows system directory lacks')
         native_profile_bytes = args.windows_provider.read_bytes()
         def checked_tree(directory, expected):
             import stat
@@ -193,6 +320,27 @@ try:
         rust_env[linker_key] = clang
         rust_env[cc_key] = clang
         rust_env['AR_' + rust_target.replace('-', '_')] = check_image(profile['archiveTool'])
+        # The *-windows-gnullvm std links LLVM's libunwind dynamically unless
+        # `crt-static` is enabled (library/unwind/src/lib.rs: `#[link(name =
+        # "unwind", kind = "static", ..., cfg(target_feature = "crt-static"))]`,
+        # else a plain `-lunwind`, which llvm-mingw satisfies with the import
+        # library of its libunwind.dll). The gate runs the products with no
+        # provider directory on the DLL search path, so link it statically:
+        # every image built for the target then imports only the OS's DLLs,
+        # which check_system_imports() verifies on the produced images.
+        # Appended to target.<triple>.rustflags (where
+        # ci/provision-rust-target-std.py put the target sysroot), so build
+        # scripts and proc-macros, built for the host, are unaffected.
+        # https://doc.rust-lang.org/reference/linkage.html#static-and-dynamic-c-runtimes
+        for name in ('CARGO_ENCODED_RUSTFLAGS', 'RUSTFLAGS'):
+            # Either one makes Cargo ignore target.<triple>.rustflags.
+            if os.environ.get(name):
+                raise RuntimeError(name + ' is set; the ' + rust_target + ' rustflags would be ignored')
+        rustflags_key = 'CARGO_TARGET_' + rust_key + '_RUSTFLAGS'
+        rust_env[rustflags_key] = ' '.join(filter(None, [os.environ.get(rustflags_key, ''), '-Ctarget-feature=+crt-static']))
+        provider_runtime = {path.name.casefold() for path in Path(clang).parent.parent.rglob('*.dll')}
+        if 'libunwind.dll' not in provider_runtime:
+            raise RuntimeError('Declared provider ships no libunwind.dll; its runtime census is not the one checked')
         native_flags = ['--skipUserCfg', '--skipParentCfg', '--cc:clang',
             '--lib:' + str(Path(nim).parent.parent / 'lib'), '--clang.exe:' + clang, '--clang.linkerexe:' + clang,
             '-d:msys2MingwInc=' + str(sdk / 'include'),
@@ -405,7 +553,11 @@ try:
             unix_authority_guard()
         if argv[0] != 'nim':
             raise RuntimeError('Unsupported declared Nim invocation')
-        subprocess.run([nim, argv[1], *native_flags, *argv[2:]], cwd=environment, env=nim_env, check=True)
+        command = [nim, argv[1], *native_flags, *argv[2:]]
+        completed = subprocess.run(command, cwd=environment, env=nim_env)
+        if completed.returncode:
+            print('Nim exited with status ' + describe_exit(completed.returncode), file=sys.stderr, flush=True)
+            raise subprocess.CalledProcessError(completed.returncode, command)
 
     # Retain real artifacts for source-bound qualification and diagnosis.
     if args.work_root:
@@ -424,6 +576,7 @@ try:
     if os.name == 'nt':
         producer_row = {'path': str(binary), 'machine': expected_cpu, 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}
         check_image(producer_row)
+        check_system_imports(binary, provider_runtime)
     subprocess.run([str(binary), 'produce', str(nim_images)], check=True)
     if os.name == 'nt':
         subprocess.run(['cargo', 'build', '--locked', '--offline',
@@ -434,6 +587,7 @@ try:
         rust_producer_row = {'path': str(rust_producer), 'machine': expected_cpu,
             'sha256': hashlib.sha256(rust_producer.read_bytes()).hexdigest()}
         check_image(rust_producer_row)
+        check_system_imports(rust_producer, provider_runtime)
         subprocess.run([str(rust_producer), str(rust_images)], cwd=root, check=True)
     else:
         subprocess.run(['cargo', 'run', '--locked', '--offline',

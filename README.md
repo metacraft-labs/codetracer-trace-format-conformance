@@ -25,6 +25,7 @@ the other before it lands.
 | `test_nim_value_stream_crossread` | `nim_value_stream_crossread.rs` | A Nim-written `values.dat`, decoded by the Rust `ValueStreamReader`: every step's `(name_id, CBOR)` pairs, value-less steps included. |
 | `test_nim_io_event_stream_crossread` | `nim_io_event_stream_crossread.rs` | A Nim-written `events.dat`, decoded by the Rust `IoEventStreamReader`: every record's kind, step, metadata and content. |
 | `test_nim_step_map_crossread` | `nim_step_map_crossread.rs` | Every `step-map.ns` lookup answered by the Nim and the Rust reader, lookups of line 0 included. |
+| `test_nim_declared_root_crossread` | `nim_declared_root_crossread.rs` | One Nim-written trace rebuilt with an auto-filled root, a 64-slot root (the trace past slot 30 in both) and 1024- and 2048-byte blocks: the geometry, member count and path, function and step counts the Nim and the Rust readers read, which must be the base trace's. |
 | `test_nim_reads_shared_trace_storage_fixtures` | — | The Nim parser reads the trace-storage fixtures the Rust implementation's tests read (`codetracer_ctfs/tests/fixtures/trace_storage`) to the same values. |
 
 A driver writes a container with the Nim writer, records what the Nim reader

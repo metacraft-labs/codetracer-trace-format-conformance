@@ -22,4 +22,9 @@ in {
   peerNimble = packages.ci-nimble or (refuse "declared Nimble runtime constructor absent");
   peerNimbleSource = packages.ci-nimble-source or (refuse "declared Nimble source constructor absent");
   traceWriterFfi = packages.trace-writer-ffi or (refuse "declared static archive constructor absent");
+  # The locked peer's own development shell, which the runtime constructor
+  # rebuilds offline with `nix print-dev-env --offline` in its fresh clone.
+  # ci/acquire-entry-runtime.sh realises it first, online, so that offline
+  # rebuild finds every input in the store (see there).
+  peerDevShell = supplier.devShells.${system}.default or (refuse "declared development shell absent");
 }

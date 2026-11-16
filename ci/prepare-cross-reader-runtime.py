@@ -22,6 +22,34 @@ helper_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(helper_module)
 verify_generated_outputs = helper_module.verify_generated_outputs
 
+# Where a failed stage's own error messages go, so CI can print them
+# (ci/acquire-entry-runtime.sh): a Nix constructor's error records, or any
+# other stage's stderr tail. Taken out of the environment before anything
+# runs: no child sees it, and the environment-continuity guards below compare
+# against the environment without it. The receipts never hold these bodies.
+NIX_DIAGNOSTICS = os.environ.pop('ENTRY_RUNTIME_NIX_DIAGNOSTICS', None)
+# Values that must never reach the diagnostics: every variable whose name says
+# it carries a credential, and the base64 forms in which Git's HTTP
+# authorization headers carry them. Taken from this process's environment
+# while it is still whole, and again from a stage's own environment (the
+# peer's activated shell) when that stage fails.
+def _secret_forms(value):
+    yield value
+    # Each line of a multi-line value (a PEM key, say) on its own: the
+    # diagnostics keep only the last lines of a stage's stderr, which can
+    # start part-way through such a value, where the whole would not match.
+    for line in value.splitlines():
+        if len(line.strip()) >= 8:
+            yield line.strip()
+    for raw in (value, 'x-access-token:' + value):
+        yield base64.b64encode(raw.encode()).decode().rstrip('=')
+def secret_values(environment):
+    return {form for name, value in environment.items()
+            if re.search(r'TOKEN|SECRET|PASSW|AUTH|PRIVATE|CREDENTIAL|_KEY$|^KEY|^GIT_CONFIG_VALUE_', name.upper())
+            and len(value) >= 8
+            for form in _secret_forms(value)}
+SECRET_VALUES = secret_values(os.environ)
+
 arguments = sys.argv[1:]
 peer_override = None
 if len(arguments) == 9 and arguments[-2] == '--peer-root':
@@ -235,6 +263,85 @@ def nix_structured_observation(text):
     result["resultsObserved"] = sorted(results)
     return result
 
+# Credential shapes redacted even when no variable names them: GitHub tokens,
+# credentials embedded in URLs and HTTP authorization headers.
+SECRET_PATTERNS = [
+    (re.compile(r'(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})'), '***'),
+    # Any userinfo in a URL, `user:password@` or a bare token `token@`.
+    (re.compile(r'(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@'), r'\1***@'),
+    (re.compile(r'(?i)\b(authorization:\s*(?:(?:basic|bearer|token)\s+)?)\S+'), r'\1***'),
+    (re.compile(r'(?i)\b(access-tokens\s*=\s*)\S.*'), r'\1***'),
+]
+ANSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+
+def redact(text, environment=None):
+    values = SECRET_VALUES | secret_values(environment or {})
+    # Longest first, so a value is never left half-masked by one it contains.
+    for value in sorted(values, key=len, reverse=True):
+        text = text.replace(value, '***')
+    for pattern, replacement in SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+def publish_failure_diagnostics(role, exit_code, text, environment=None):
+    """Append what names the cause of a failed stage, redacted and bounded, to
+    NIX_DIAGNOSTICS for the CI log. For a Nix constructor: its error-level
+    messages and, for each derivation they name, the last lines of that
+    build's log. (With `--log-format internal-json` Nix leaves the log tail out
+    of the error message and streams every build line as a separate record
+    instead.) For any other stage -- the metadata writer, the reader build,
+    Direnv activation -- or a Nix run that left no error record: the last
+    lines of its stderr. Nothing else: not the rest of the build logs, not
+    stdout. `environment` is the stage's own environment, whose credentials
+    are redacted too."""
+    if not NIX_DIAGNOSTICS:
+        return
+    messages = []
+    build_of = {}     # activity id -> derivation path
+    tails = {}        # activity id -> last build log lines
+    for line in text.splitlines():
+        if not line.startswith('@nix '):
+            continue
+        try:
+            record = json.loads(line[5:])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        action, fields = record.get('action'), record.get('fields')
+        if action == 'msg' and record.get('level') == 0 and isinstance(record.get('msg'), str):
+            messages.append(ANSI.sub('', record['msg']))
+        elif (action == 'start' and record.get('type') == 105 and isinstance(fields, list)
+              and fields and isinstance(fields[0], str)):
+            build_of[record.get('id')] = fields[0]
+        elif (action == 'result' and record.get('type') == 101 and isinstance(fields, list)
+              and fields and isinstance(fields[0], str)):
+            tail = tails.setdefault(record.get('id'), [])
+            tail.append(ANSI.sub('', fields[0]))
+            del tail[:-40]
+    if messages:
+        named = set(re.findall(r'/nix/store/[a-z0-9]{32}-[^\s\'"`]+\.drv', '\n'.join(messages)))
+        body = ''.join('--- ' + role + ' error ' + str(n + 1) + ' of ' + str(len(messages)) + '\n'
+                       + redact(m.rstrip('\n'), environment)[:8000] + '\n' for n, m in enumerate(messages))
+        for activity, drv in build_of.items():
+            if drv in named and tails.get(activity):
+                body += ('--- ' + role + ': last ' + str(len(tails[activity])) + ' build log lines of '
+                         + drv + '\n' + '\n'.join(tails[activity]) + '\n')
+    else:
+        # No structured error: the plain stderr tail is all there is.
+        # The header has the shape of the one above, so acquire-entry-runtime.sh
+        # annotates its first line the same way.
+        plain = [l for l in text.splitlines() if not l.startswith('@nix ')][-40:]
+        body = ('--- ' + role + ' error 1 of 1 (exit ' + str(exit_code) + '; last '
+                + str(len(plain)) + ' stderr lines)\n'
+                + redact(ANSI.sub('', '\n'.join(plain)), environment)[-8000:] + '\n')
+    # 64 KiB for the whole file, across every stage that appends to it. Every
+    # cut above is made after redaction, so none can split a secret and leave
+    # part of it; this last pass covers the headers and build-log tails.
+    with open(NIX_DIAGNOSTICS, 'a', encoding='utf-8') as stream:
+        room = max(0, 65536 - stream.tell())
+        stream.write(redact(body, environment)[:room])
+
 def run_child(command, peer, role, child_env=None):
     child = subprocess.Popen(command, cwd=peer, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              start_new_session=True, env=child_env)
@@ -316,6 +423,10 @@ def run_child(command, peer, role, child_env=None):
             row['nonsecretFailureClassification']['classes'].update(fixed_classes)
             row['nonsecretFailureClassification']['nixStructuredObservation'] = (
                 nix_structured_observation(text))
+        # Every failed stage, Nix or not, names its cause in the CI log
+        # (never in the receipt): the classification above says only which
+        # fixed patterns matched.
+        publish_failure_diagnostics(role, child.returncode, text, child_env)
     while True:
         remaining, unknown = [], []
         for proc in Path('/proc').iterdir():
