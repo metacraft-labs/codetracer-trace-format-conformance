@@ -291,6 +291,13 @@ jobs:
         with:
           env-flavor: reprobuild
           repro-version: v0.2.17
+          # No reprobuild release ships a windows-aarch64 bundle, so the ARM64
+          # runner builds repro from source at this ref (x64 installs the
+          # v0.2.17 release above and ignores it). Pinned to the first
+          # reprobuild commit whose catalog has an aarch64 Windows rustc and
+          # cargo; drop it once a release with a windows-aarch64 bundle is
+          # pinned in repro-version.
+          repro-build-pin: 01e7bcf6ec0720c2e720aa49385316aa89c10dce
           gh-token: ${{ steps.ci_token.outputs.token }}
           siblings: ${{ steps.siblings.outputs.list }}
 
