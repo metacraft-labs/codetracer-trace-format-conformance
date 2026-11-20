@@ -146,6 +146,15 @@ jobs:
         if: github.repository == 'metacraft-labs/codetracer-trace-format-conformance'
         run: nix develop --command just lint
 
+      # The entry gate's first Cargo build is `--offline`. Lint's clippy
+      # fetches the locked crates as a side effect, but Lint runs only in this
+      # repository: when another repository calls this workflow, nothing has
+      # fetched them on a fresh runner, and the gate fails with "no matching
+      # package named `cc` found" (codetracer-trace-format job 136468110981).
+      # Fetch them explicitly, as the Windows legs do.
+      - name: Fetch the locked crates
+        run: nix develop --command cargo fetch --locked
+
       # GITHUB_TOKEN is for one request: the locked Nim peer's Nimble metadata
       # writer (nix/construct-runtime-metadata.nim) reads the official Nim
       # release list from api.github.com/repos/nim-lang/Nim/tags, a public
