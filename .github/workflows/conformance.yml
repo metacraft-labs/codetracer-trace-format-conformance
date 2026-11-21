@@ -307,6 +307,14 @@ jobs:
           # cargo; drop it once a release with a windows-aarch64 bundle is
           # pinned in repro-version.
           repro-build-pin: 01e7bcf6ec0720c2e720aa49385316aa89c10dce
+          # Say so explicitly on ARM64. Left to itself, setup-reprobuild picks
+          # the release archive from Git Bash's `uname -m`, and Git Bash is an
+          # x64 program emulated there, so it answers x86_64 and installs the
+          # windows-x86_64 release. That repro then sees an x86_64 host and
+          # realizes the x64 rustc, which the gate refuses as not native to
+          # aarch64-pc-windows-gnullvm (job 136635421681, and every ARM64 run
+          # of this workflow so far).
+          repro-from-source: ${{ matrix.runner == 'eph-win-arm64' }}
           gh-token: ${{ steps.ci_token.outputs.token }}
           siblings: ${{ steps.siblings.outputs.list }}
 
