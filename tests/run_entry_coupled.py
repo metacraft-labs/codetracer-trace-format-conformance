@@ -578,22 +578,15 @@ try:
         check_image(producer_row)
         check_system_imports(binary, provider_runtime)
     subprocess.run([str(binary), 'produce', str(nim_images)], check=True)
-    if os.name == 'nt':
-        subprocess.run(['cargo', 'build', '--locked', '--offline',
-            '--example', 'entry_cross_fixture', '--target', rust_target], cwd=root, env=rust_env, check=True)
-        cargo_target = Path(os.environ.get('CARGO_TARGET_DIR', root / 'target'))
-        if not cargo_target.is_absolute(): cargo_target = root / cargo_target
-        rust_producer = cargo_target / rust_target / 'debug/examples/entry_cross_fixture.exe'
-        rust_producer_row = {'path': str(rust_producer), 'machine': expected_cpu,
-            'sha256': hashlib.sha256(rust_producer.read_bytes()).hexdigest()}
-        check_image(rust_producer_row)
-        check_system_imports(rust_producer, provider_runtime)
-        subprocess.run([str(rust_producer), str(rust_images)], cwd=root, check=True)
-    else:
-        subprocess.run(['cargo', 'run', '--locked', '--offline',
-                        '--example', 'entry_cross_fixture',
-                        '--', str(rust_images)], cwd=root, check=True)
-    subprocess.run([str(binary), 'read-rust', str(rust_images)], check=True)
+    # The Rust producer builds under the same prepared environment as the
+    # `cargo test` below. Without it, codetracer_trace_writer_nim's build
+    # script sees ENTRY_NIM_RUNTIME_AUTHORITY (exported by ci/entry-gate.sh),
+    # skips its nimble install, and gets no --path for the Nim requirements,
+    # so `nim` resolves `results` only from whatever a host's ~/.nimble holds.
+    # This repository's own Linux leg passed only because its Lint step's
+    # clippy had already run that nimble install; a caller of the reusable
+    # workflow skips Lint and failed with "cannot open file: results"
+    # (codetracer-trace-format job 136676434843).
     env = rust_env.copy() if os.name == 'nt' else nim_env.copy()
     if os.name != 'nt':
         env['ENTRY_NIM_RUNTIME_AUTHORITY'] = str(authority_path)
@@ -613,6 +606,22 @@ try:
         guard_peer_execution_namespace()
         env['CODETRACER_TRACE_FORMAT_NIM_SKIP_NIMBLE_INSTALL'] = '1'
         env['CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS'] = os.pathsep.join(package_paths)
+    if os.name == 'nt':
+        subprocess.run(['cargo', 'build', '--locked', '--offline',
+            '--example', 'entry_cross_fixture', '--target', rust_target], cwd=root, env=rust_env, check=True)
+        cargo_target = Path(os.environ.get('CARGO_TARGET_DIR', root / 'target'))
+        if not cargo_target.is_absolute(): cargo_target = root / cargo_target
+        rust_producer = cargo_target / rust_target / 'debug/examples/entry_cross_fixture.exe'
+        rust_producer_row = {'path': str(rust_producer), 'machine': expected_cpu,
+            'sha256': hashlib.sha256(rust_producer.read_bytes()).hexdigest()}
+        check_image(rust_producer_row)
+        check_system_imports(rust_producer, provider_runtime)
+        subprocess.run([str(rust_producer), str(rust_images)], cwd=root, check=True)
+    else:
+        subprocess.run(['cargo', 'run', '--locked', '--offline',
+                        '--example', 'entry_cross_fixture',
+                        '--', str(rust_images)], cwd=root, env=env, check=True)
+    subprocess.run([str(binary), 'read-rust', str(rust_images)], check=True)
     if args.prepare_only and args.fixture_output is None:
         raise RuntimeError('Declared fixture output is required')
     published_root = args.fixture_output if args.prepare_only else root / 'target' / 'entry-fixtures'
