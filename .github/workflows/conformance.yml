@@ -296,25 +296,16 @@ jobs:
           ./ci/ensure-native-cmake.ps1 -Architecture $architecture -Destination $destination
 
       - name: Setup dev env (reprobuild)
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@26448a158691e2ce4858c10312618a306a333b8e
+        # No repro-version or repro-build-pin: the action installs the
+        # organisation's reprobuild pin (pins/reprobuild.json). Windows x64
+        # takes that commit's pin prerelease; ARM64, which it has no bundle
+        # for, builds the commit from source. setup-reprobuild reads the
+        # machine's architecture from RUNNER_ARCH, not from Git Bash's
+        # emulated `uname -m`, so repro-from-source is no longer needed to
+        # keep the x64 build off ARM64.
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
-          repro-version: v0.2.17
-          # No reprobuild release ships a windows-aarch64 bundle, so the ARM64
-          # runner builds repro from source at this ref (x64 installs the
-          # v0.2.17 release above and ignores it). Pinned to the first
-          # reprobuild commit whose catalog has an aarch64 Windows rustc and
-          # cargo; drop it once a release with a windows-aarch64 bundle is
-          # pinned in repro-version.
-          repro-build-pin: 01e7bcf6ec0720c2e720aa49385316aa89c10dce
-          # Say so explicitly on ARM64. Left to itself, setup-reprobuild picks
-          # the release archive from Git Bash's `uname -m`, and Git Bash is an
-          # x64 program emulated there, so it answers x86_64 and installs the
-          # windows-x86_64 release. That repro then sees an x86_64 host and
-          # realizes the x64 rustc, which the gate refuses as not native to
-          # aarch64-pc-windows-gnullvm (job 136635421681, and every ARM64 run
-          # of this workflow so far).
-          repro-from-source: ${{ matrix.runner == 'eph-win-arm64' }}
           gh-token: ${{ steps.ci_token.outputs.token }}
           siblings: ${{ steps.siblings.outputs.list }}
 
